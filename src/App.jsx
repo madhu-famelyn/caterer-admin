@@ -28,7 +28,8 @@ export default function App() {
     zip: '',
     cuisine_type: 'North Indian',
     bio: '',
-    price_per_guest: ''
+    price_per_guest: '',
+    image_url: ''
   })
   
   // Managing Context for a Specific Caterer
@@ -38,6 +39,11 @@ export default function App() {
   const [passwordPrompt, setPasswordPrompt] = useState(null) // { email, callback } if default password123 fails
   const [promptPasswordVal, setPromptPasswordVal] = useState('')
   const [passwordError, setPasswordError] = useState('')
+
+  // Bulk Upload States
+  const [showBulkModal, setShowBulkModal] = useState(false)
+  const [bulkJson, setBulkJson] = useState('')
+  const [bulkResult, setBulkResult] = useState(null)
   
   // Context-specific lists
   const [profileForm, setProfileForm] = useState({})
@@ -183,8 +189,74 @@ export default function App() {
         zip: '',
         cuisine_type: 'North Indian',
         bio: '',
-        price_per_guest: ''
+        price_per_guest: '',
+        image_url: ''
       })
+      fetchCaterers()
+    } catch (err) {
+      showAlert(err.message, 'error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Handle local file upload to backend
+  const handleFileUpload = async (file, onUploadSuccess) => {
+    if (!file) return
+    const formData = new FormData()
+    formData.append('file', file)
+    setLoading(true)
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/upload`, {
+        method: 'POST',
+        body: formData
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}))
+        throw new Error(errorData.detail || 'File upload failed')
+      }
+      const data = await res.json()
+      const absoluteUrl = `${apiUrl}${data.file_url}`
+      onUploadSuccess(absoluteUrl)
+      showAlert('File uploaded successfully!')
+    } catch (err) {
+      showAlert(err.message, 'error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Bulk Upload Handler
+  const handleBulkUpload = async (e) => {
+    e.preventDefault()
+    setLoading(true)
+    setBulkResult(null)
+    try {
+      let parsed
+      try {
+        parsed = JSON.parse(bulkJson)
+      } catch (err) {
+        throw new Error('Invalid JSON format. Please check your syntax.')
+      }
+
+      if (!Array.isArray(parsed)) {
+        throw new Error('JSON must be an array of caterer objects.')
+      }
+
+      const res = await fetch(`${apiUrl}/api/v1/caterers/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed)
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json()
+        throw new Error(errorData.detail || 'Bulk upload failed')
+      }
+
+      const data = await res.json()
+      setBulkResult(data)
+      showAlert(`Bulk upload completed! Created: ${data.created_count}, Failed: ${data.failed_count}`)
       fetchCaterers()
     } catch (err) {
       showAlert(err.message, 'error')
@@ -294,8 +366,17 @@ export default function App() {
     e.preventDefault()
     setLoading(true)
     try {
+      let imageUrl = profileForm.image_url
+      if (imageUrl) {
+        const urlRegex = /https?:\/\/[^\s'",\]]+[^\s'",\]\.]/g;
+        const urls = imageUrl.match(urlRegex) || [];
+        if (urls.length > 0) {
+          imageUrl = urls[0]
+        }
+      }
       const payload = {
         ...profileForm,
+        image_url: imageUrl,
         price_per_guest: profileForm.price_per_guest ? Number(profileForm.price_per_guest) : null,
         service_tags: profileForm.service_tags.split(',').map(t => t.trim()).filter(Boolean)
       }
@@ -416,8 +497,17 @@ export default function App() {
     e.preventDefault()
     setLoading(true)
     try {
+      let imageUrl = newAward.image_url
+      if (imageUrl) {
+        const urlRegex = /https?:\/\/[^\s'",\]]+[^\s'",\]\.]/g;
+        const urls = imageUrl.match(urlRegex) || [];
+        if (urls.length > 0) {
+          imageUrl = urls[0]
+        }
+      }
       const payload = {
         ...newAward,
+        image_url: imageUrl,
         year: newAward.year ? Number(newAward.year) : null
       }
       const res = await fetch(`${apiUrl}/api/v1/awards/`, {
@@ -460,18 +550,35 @@ export default function App() {
   // Context: Gallery CRUD
   const handleAddPhoto = async (e) => {
     e.preventDefault()
+    if (!newPhoto.file_url) return
     setLoading(true)
+    const urlRegex = /https?:\/\/[^\s'",\]]+[^\s'",\]\.]/g;
+    const urls = newPhoto.file_url.match(urlRegex) || [];
+    if (urls.length === 0) {
+      showAlert('No valid image URLs found in input.', 'error')
+      setLoading(false)
+      return
+    }
     try {
-      const res = await fetch(`${apiUrl}/api/v1/gallery/upload`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${activeToken}`
-        },
-        body: JSON.stringify(newPhoto)
-      })
-      if (!res.ok) throw new Error('Photo link upload failed')
-      showAlert('Photo added to gallery!')
+      let successCount = 0
+      for (const url of urls) {
+        const res = await fetch(`${apiUrl}/api/v1/gallery/upload`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeToken}`
+          },
+          body: JSON.stringify({ ...newPhoto, file_url: url })
+        })
+        if (res.ok) {
+          successCount++
+        }
+      }
+      if (successCount > 0) {
+        showAlert(`Successfully uploaded ${successCount} photo(s) to gallery!`)
+      } else {
+        throw new Error('Photo link upload failed')
+      }
       setNewPhoto({ file_url: '', type: 'photo' })
       fetchContextData(activeCaterer.id, activeToken)
     } catch (err) {
@@ -707,9 +814,14 @@ export default function App() {
                 <h1>Platform Registry Dashboard</h1>
                 <p>Overview of active caterers, registrations, compliance, and user reviews.</p>
               </div>
-              <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>
-                ➕ Register New Caterer
-              </button>
+              <div style={{ display: 'flex', gap: '12px' }}>
+                <button className="btn btn-secondary" onClick={() => setShowBulkModal(true)}>
+                  📥 Bulk Upload Caterers
+                </button>
+                <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>
+                  ➕ Register New Caterer
+                </button>
+              </div>
             </div>
 
             {/* Platform metrics */}
@@ -902,6 +1014,28 @@ export default function App() {
                       <input type="text" placeholder="45, Marine Drive" value={newCatererForm.address} onChange={e => setNewCatererForm({...newCatererForm, address: e.target.value})} />
                     </div>
                     <div className="form-group">
+                      <label>Profile Image URL or File Upload</label>
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <input
+                          type="text"
+                          placeholder="https://images.unsplash.com/photo-..."
+                          value={newCatererForm.image_url}
+                          onChange={e => setNewCatererForm({...newCatererForm, image_url: e.target.value})}
+                          style={{ flexGrow: 1 }}
+                        />
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewCatererForm({...newCatererForm, image_url: url}))}
+                          style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
+                          id="register-profile-image-file"
+                        />
+                        <label htmlFor="register-profile-image-file" className="btn btn-secondary" style={{ cursor: 'pointer', whiteSpace: 'nowrap', margin: 0, padding: '10px 14px' }}>
+                          📁 Upload File
+                        </label>
+                      </div>
+                    </div>
+                    <div className="form-group">
                       <label>Biography</label>
                       <textarea placeholder="Tell clients about this caterer..." rows={3} value={newCatererForm.bio} onChange={e => setNewCatererForm({...newCatererForm, bio: e.target.value})} />
                     </div>
@@ -909,6 +1043,95 @@ export default function App() {
                       Create Profile Account
                     </button>
                   </form>
+                </div>
+              </div>
+            )}
+
+            {showBulkModal && (
+              <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '24px', overflowY: 'auto' }}>
+                <div className="card" style={{ width: '700px', maxHeight: '90vh', overflowY: 'auto' }}>
+                  <div className="card-header">
+                    <h3 className="card-title">📥 Bulk Upload Caterers (JSON)</h3>
+                    <button onClick={() => { setShowBulkModal(false); setBulkResult(null); }} style={{ background: 'none', border: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
+                  </div>
+                  <form onSubmit={handleBulkUpload} style={{ display: 'flex', flexDirection: 'column', gap: '16px', textAlign: 'left', padding: '20px' }}>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', margin: 0 }}>
+                      Paste a JSON array of caterer objects. Each object should follow the format below:
+                    </p>
+                    <textarea
+                      placeholder={`[\n  {\n    "business_name": "Royal Feast",\n    "owner_name": "Rajesh Kumar",\n    "email": "rajesh@royalfeast.com",\n    "password": "password123",\n    "city": "Mumbai",\n    "state": "Maharashtra",\n    "cuisine_type": "North Indian",\n    "price_per_guest": 500,\n    "service_tags": ["buffet", "wedding"]\n  }\n]`}
+                      rows={12}
+                      value={bulkJson}
+                      onChange={e => setBulkJson(e.target.value)}
+                      required
+                      style={{
+                        width: '100%',
+                        fontFamily: 'monospace',
+                        padding: '12px',
+                        borderRadius: '8px',
+                        border: '1px solid var(--border)',
+                        background: 'var(--bg-card)',
+                        color: 'var(--text-main)',
+                        fontSize: '0.85rem'
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '12px' }}>
+                      <button type="button" className="btn btn-secondary" onClick={() => {
+                        setBulkJson(JSON.stringify([
+                          {
+                            "business_name": "Delhi Darbar Catering",
+                            "owner_name": "Amit Goel",
+                            "email": "amit@delhidarbar.com",
+                            "password": "password123",
+                            "city": "Delhi",
+                            "state": "Delhi",
+                            "cuisine_type": "North Indian",
+                            "price_per_guest": 650,
+                            "service_tags": ["corporate", "dinner"]
+                          },
+                          {
+                            "business_name": "Dakshin Delights",
+                            "owner_name": "Karthik Iyer",
+                            "email": "karthik@dakshin.com",
+                            "password": "password123",
+                            "city": "Chennai",
+                            "state": "Tamil Nadu",
+                            "cuisine_type": "South Indian",
+                            "price_per_guest": 450,
+                            "service_tags": ["traditional", "lunch"]
+                          }
+                        ], null, 2))
+                      }}>
+                        📝 Load Sample Template
+                      </button>
+                      <button type="submit" className="btn btn-primary" style={{ flexGrow: 1 }} disabled={loading}>
+                        {loading ? 'Processing...' : '🚀 Start Upload'}
+                      </button>
+                    </div>
+                  </form>
+
+                  {bulkResult && (
+                    <div style={{ margin: '20px', padding: '16px', borderRadius: '8px', border: '1px solid var(--border)', background: 'rgba(99,102,241,0.05)' }}>
+                      <h4 style={{ marginBottom: '8px', color: 'var(--primary)', textAlign: 'left' }}>Upload Summary:</h4>
+                      <div style={{ display: 'flex', gap: '20px', marginBottom: '12px', fontSize: '0.9rem' }}>
+                        <span>Created: <strong style={{ color: 'var(--success)' }}>{bulkResult.created_count}</strong></span>
+                        <span>Failed: <strong style={{ color: '#ef4444' }}>{bulkResult.failed_count}</strong></span>
+                      </div>
+                      
+                      {bulkResult.errors && bulkResult.errors.length > 0 && (
+                        <div style={{ maxHeight: '150px', overflowY: 'auto', textAlign: 'left' }}>
+                          <h5 style={{ fontSize: '0.85rem', color: '#ef4444', marginBottom: '4px' }}>Errors:</h5>
+                          <ul style={{ fontSize: '0.8rem', paddingLeft: '20px', margin: 0, color: 'var(--text-secondary)' }}>
+                            {bulkResult.errors.map((err, idx) => (
+                              <li key={idx}>
+                                <strong>{err.email}</strong>: {err.error}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -965,8 +1188,20 @@ export default function App() {
                       <input type="text" value={profileForm.mobile} onChange={e => setProfileForm({ ...profileForm, mobile: e.target.value })} />
                     </div>
                     <div className="form-group">
-                      <label>Cover Photo URL</label>
-                      <input type="text" placeholder="https://unsplash..." value={profileForm.image_url} onChange={e => setProfileForm({ ...profileForm, image_url: e.target.value })} />
+                      <label>Cover Photo URL or File Upload</label>
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <input type="text" placeholder="https://unsplash..." value={profileForm.image_url} onChange={e => setProfileForm({ ...profileForm, image_url: e.target.value })} style={{ flexGrow: 1 }} />
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={e => handleFileUpload(e.target.files[0], (url) => setProfileForm({ ...profileForm, image_url: url }))}
+                          style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
+                          id="edit-profile-image-file"
+                        />
+                        <label htmlFor="edit-profile-image-file" className="btn btn-secondary" style={{ cursor: 'pointer', whiteSpace: 'nowrap', margin: 0, padding: '10px 14px' }}>
+                          📁 Upload File
+                        </label>
+                      </div>
                     </div>
                   </div>
                   <div className="form-group">
@@ -1224,8 +1459,20 @@ export default function App() {
                       </div>
                     </div>
                     <div className="form-group">
-                      <label>Award Certificate/Photo Image Link</label>
-                      <input type="text" placeholder="https://..." value={newAward.image_url} onChange={e => setNewAward({ ...newAward, image_url: e.target.value })} />
+                      <label>Award Certificate/Photo Image Link or File Upload</label>
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <input type="text" placeholder="https://..." value={newAward.image_url} onChange={e => setNewAward({ ...newAward, image_url: e.target.value })} style={{ flexGrow: 1 }} />
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewAward({ ...newAward, image_url: url }))}
+                          style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
+                          id="new-award-image-file"
+                        />
+                        <label htmlFor="new-award-image-file" className="btn btn-secondary" style={{ cursor: 'pointer', whiteSpace: 'nowrap', margin: 0, padding: '10px 14px' }}>
+                          📁 Upload File
+                        </label>
+                      </div>
                     </div>
                     <div className="form-group">
                       <label>Award description details</label>
@@ -1265,13 +1512,25 @@ export default function App() {
                   <div className="card-header">
                     <h3 className="card-title">➕ Add New Photo Link</h3>
                   </div>
-                  <form onSubmit={handleAddPhoto} style={{ textAlign: 'left', display: 'flex', gap: '16px', alignItems: 'flex-end' }}>
+                  <form onSubmit={handleAddPhoto} style={{ textAlign: 'left', display: 'flex', gap: '16px', alignItems: 'flex-end', padding: '20px' }}>
                     <div className="form-group" style={{ flexGrow: 1, marginBottom: 0 }}>
-                      <label>Photo Image Link URL *</label>
-                      <input type="text" placeholder="https://images.unsplash.com/photo-..." value={newPhoto.file_url} onChange={e => setNewPhoto({ ...newPhoto, file_url: e.target.value })} required />
+                      <label>Photo Image Link URL or File Upload *</label>
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <input type="text" placeholder="https://images.unsplash.com/photo-..." value={newPhoto.file_url} onChange={e => setNewPhoto({ ...newPhoto, file_url: e.target.value })} required style={{ flexGrow: 1 }} />
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewPhoto({ ...newPhoto, file_url: url }))}
+                          style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
+                          id="new-photo-image-file"
+                        />
+                        <label htmlFor="new-photo-image-file" className="btn btn-secondary" style={{ cursor: 'pointer', whiteSpace: 'nowrap', margin: 0, padding: '10px 14px' }}>
+                          📁 Upload File
+                        </label>
+                      </div>
                     </div>
                     <button type="submit" className="btn btn-primary" style={{ height: '46px' }}>
-                      Upload Photo
+                      Add Photo
                     </button>
                   </form>
                 </div>

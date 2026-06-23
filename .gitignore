@@ -4,6 +4,7 @@
 node_modules/
 .pnp
 .pnp.js
+.yarn/install-state.gz
 
 # ===========================
 # Environment Variables
@@ -40,24 +41,43 @@ lerna-debug.log*
 .cache/
 .parcel-cache/
 .eslintcache
+.stylelintcache
 .vite/
+.turbo/
+
+# ===========================
+# Testing
+# ===========================
+coverage/
+*.lcov
+.nyc_output/
+
+# ===========================
+# TypeScript
+# ===========================
+*.tsbuildinfo
 
 # ===========================
 # Editor & OS Files
 # ===========================
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea/
+*.iml
 .DS_Store
 Thumbs.db
+Desktop.ini
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+*~
 
 # ===========================
 # Misc
 # ===========================
 *.local
-*.tsbuildinfo
+.npmrc
+.pnpmfile.cjs
