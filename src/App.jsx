@@ -3,18 +3,48 @@ import * as XLSX from 'xlsx'
 import './index.css'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
+const apiUrl = API_BASE_URL.replace(/\/$/, '')
+
+function cleanImageUrl(url) {
+  if (!url) return ''
+  // Google Maps photo references expire — treat them as empty to avoid 404 noise
+  if (
+    url.includes('lh5.googleusercontent.com') ||
+    url.includes('lh3.googleusercontent.com') ||
+    url.includes('googleusercontent.com/p/AF1Qip')
+  ) {
+    return ''
+  }
+  if (url.startsWith('photo_folder:')) {
+    const matches = url.match(/https?:\/\/[^\s,\]\['"‘’“”]+/)
+    if (matches && matches[0]) {
+      return matches[0].replace(/['"‘’“”\]\[,]+$/, '')
+    }
+    return ''
+  }
+  if (url.startsWith('/uploads') || url.startsWith('uploads/')) {
+    const cleanPath = url.startsWith('/') ? url : `/${url}`
+    return `${apiUrl}${cleanPath}`
+  }
+  return url
+}
+
 
 export default function App() {
   // Global States
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(false)
   const [loginForm, setLoginForm] = useState({ email: 'admin@caterhub.com', password: '' })
   const [loginError, setLoginError] = useState('')
-  
+  const [showAdminPassword, setShowAdminPassword] = useState(false)
+
   const [caterers, setCaterers] = useState([])
   const [loading, setLoading] = useState(false)
   const [alert, setAlert] = useState({ text: '', type: '' }) // type: 'success' | 'error'
   const [searchQuery, setSearchQuery] = useState('')
-  
+  const [pleaseWaitMessage, setPleaseWaitMessage] = useState('')
+  const [showSuccessOverlay, setShowSuccessOverlay] = useState(false)
+  const [verifiedCatererName, setVerifiedCatererName] = useState('')
+
   // Modals & Context States
   const [showAddModal, setShowAddModal] = useState(false)
   const [newCatererForm, setNewCatererForm] = useState({
@@ -32,7 +62,7 @@ export default function App() {
     price_per_guest: '',
     image_url: ''
   })
-  
+
   // Managing Context for a Specific Caterer
   const [activeCaterer, setActiveCaterer] = useState(null) // Caterer object currently being managed
   const [activeToken, setActiveToken] = useState('') // JWT token for the managed caterer
@@ -50,7 +80,7 @@ export default function App() {
   const [excelRows, setExcelRows] = useState([])
   const [skipErrors, setSkipErrors] = useState(false)
   const fileInputRef = useRef(null)
-  
+
   // Context-specific lists
   const [profileForm, setProfileForm] = useState({})
   const [licenses, setLicenses] = useState([])
@@ -58,14 +88,13 @@ export default function App() {
   const [awards, setAwards] = useState([])
   const [gallery, setGallery] = useState([])
   const [reviews, setReviews] = useState([])
-  
+
   // Context-specific form states
   const [newLicense, setNewLicense] = useState({ title: '', description: '', document_url: '', expiry_date: '' })
   const [newCert, setNewCert] = useState({ title: '', issued_by: '', certificate_url: '', issue_date: '' })
   const [newAward, setNewAward] = useState({ title: '', year: '', description: '', image_url: '' })
   const [newPhoto, setNewPhoto] = useState({ file_url: '', type: 'photo' })
-  
-  const apiUrl = API_BASE_URL.replace(/\/$/, '')
+
 
   const showAlert = (text, type = 'success') => {
     setAlert({ text, type })
@@ -100,7 +129,7 @@ export default function App() {
       setIsAdminLoggedIn(true)
       localStorage.setItem('admin_logged_in', 'true')
     } else {
-      setLoginError('Invalid Administrator credentials.')
+      setLoginError('Invalid Admin credentials.')
     }
   }
 
@@ -118,26 +147,6 @@ export default function App() {
       setIsAdminLoggedIn(true)
     }
   }, [])
-
-  // Toggle Verification status of any caterer
-  const toggleVerification = async (caterer) => {
-    setLoading(true)
-    try {
-      const payload = { verified: !caterer.verified }
-      const res = await fetch(`${apiUrl}/api/v1/caterers/${caterer.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-      if (!res.ok) throw new Error('Failed to update verification status')
-      showAlert(`Successfully updated verification badge for ${caterer.business_name}!`)
-      fetchCaterers()
-    } catch (err) {
-      showAlert(err.message, 'error')
-    } finally {
-      setLoading(false)
-    }
-  }
 
   // Delete a caterer
   const deleteCaterer = async (catererId, name) => {
@@ -232,6 +241,48 @@ export default function App() {
     }
   }
 
+  // Upload file AND immediately save it to the gallery_items table in DB
+  const handleGalleryFileUpload = async (file) => {
+    if (!file || !activeToken) return
+    const formData = new FormData()
+    formData.append('file', file)
+    setLoading(true)
+    try {
+      // Step 1: Upload the file to get a URL
+      const uploadRes = await fetch(`${apiUrl}/api/v1/upload`, {
+        method: 'POST',
+        body: formData
+      })
+      if (!uploadRes.ok) {
+        const errData = await uploadRes.json().catch(() => ({}))
+        throw new Error(errData.detail || 'File upload failed')
+      }
+      const uploadData = await uploadRes.json()
+      const absoluteUrl = `${apiUrl}${uploadData.file_url}`
+
+      // Step 2: Immediately save the URL to gallery_items in DB
+      const galleryRes = await fetch(`${apiUrl}/api/v1/gallery/upload`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${activeToken}`
+        },
+        body: JSON.stringify({ type: 'photo', file_url: absoluteUrl })
+      })
+      if (!galleryRes.ok) {
+        const errData = await galleryRes.json().catch(() => ({}))
+        throw new Error(errData.detail || 'Failed to save photo to gallery')
+      }
+      showAlert('Photo uploaded and saved to gallery!')
+      // Refresh gallery list
+      fetchContextData(activeCaterer.id, activeToken)
+    } catch (err) {
+      showAlert(err.message, 'error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   // Excel Importer Helpers
   const mapExcelRow = (row) => {
     const findVal = (keys) => {
@@ -245,7 +296,7 @@ export default function App() {
     };
 
     const business_name = String(findVal(['businessname', 'business_name', 'name', 'company']) || '').trim();
-    
+
     // Auto-generate email if not provided in sheet
     let email = String(findVal(['email', 'emailaddress', 'mail']) || '').trim();
     let isEmailAutoGenerated = false;
@@ -268,9 +319,13 @@ export default function App() {
     const rawTags = findVal(['servicetags', 'service_tags', 'tags', 'services']) || '';
     let image_url = findVal(['imageurl', 'image_url', 'image', 'photo', 'coverimage', 'coverurl']) || '';
     if (typeof image_url === 'string' && image_url.startsWith('photo_folder:')) {
-      const matches = image_url.match(/['"](https?:\/\/[^'"]+)['"]/);
-      if (matches && matches[1]) {
-        image_url = matches[1];
+      // Extract first https:// URL from the photo_folder string
+      // Use broad regex to handle straight quotes, curly/smart quotes, or no quotes
+      const matches = image_url.match(/https?:\/\/[^\s,\]\['"‘’“”]+/);
+      if (matches && matches[0]) {
+        image_url = matches[0].replace(/['"‘’“”\]\[,]+$/, ''); // strip trailing junk
+      } else {
+        image_url = '';
       }
     }
 
@@ -324,7 +379,7 @@ export default function App() {
       'corporate, wedding, buffet',
       'https://images.unsplash.com/photo-1555244162-803834f70033?w=500'
     ];
-    
+
     const escapeCsv = (val) => {
       if (val === null || val === undefined) return '';
       let str = String(val);
@@ -333,12 +388,12 @@ export default function App() {
       }
       return str;
     };
-    
+
     const csvContent = [
       headers.map(escapeCsv).join(','),
       exampleRow.map(escapeCsv).join(',')
     ].join('\n');
-    
+
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -358,12 +413,12 @@ export default function App() {
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         const rawJson = XLSX.utils.sheet_to_json(sheet);
-        
+
         if (!rawJson || rawJson.length === 0) {
           showAlert('No rows found in the uploaded file.', 'error');
           return;
         }
-        
+
         const mapped = rawJson.map(row => {
           const mappedRow = mapExcelRow(row);
           const errors = [];
@@ -375,14 +430,14 @@ export default function App() {
           }
           if (!mappedRow.city) errors.push('City required');
           if (!mappedRow.state) errors.push('State required');
-          
+
           return {
             ...mappedRow,
             validationErrors: errors,
             isValid: errors.length === 0
           };
         });
-        
+
         setExcelRows(mapped);
         showAlert(`Successfully parsed ${mapped.length} rows from file. Please preview before importing.`);
       } catch (err) {
@@ -407,7 +462,7 @@ export default function App() {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    
+
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       const name = file.name.toLowerCase();
@@ -430,15 +485,15 @@ export default function App() {
     setLoading(true);
     setBulkResult(null);
     try {
-      const toSubmit = skipErrors 
+      const toSubmit = skipErrors
         ? excelRows.filter(r => r.isValid)
         : excelRows;
-      
+
       const hasErrors = toSubmit.some(r => !r.isValid);
       if (hasErrors) {
         throw new Error('Please fix the errors or enable "Skip rows with errors" before importing.');
       }
-      
+
       if (toSubmit.length === 0) {
         throw new Error('No valid rows to import.');
       }
@@ -509,19 +564,22 @@ export default function App() {
 
   // Enter Caterer Context Manager
   const selectCatererContext = async (caterer, customPass = null) => {
+    console.log('selectCatererContext: starting', caterer)
+    setPleaseWaitMessage(`Accessing "${caterer.business_name}" account details...`)
     setLoading(true)
     setPasswordError('')
     const password = customPass || 'password123'
     try {
+      console.log('selectCatererContext: authenticating')
       // 1. Authenticate in background to get authorization token
       const res = await fetch(`${apiUrl}/api/v1/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: caterer.email, password })
       })
-      
+
       if (!res.ok) {
-        // Auth failed (likely they changed their password). Prompt for it.
+        console.log('selectCatererContext: authentication failed')
         if (customPass) {
           setPasswordError('Invalid vendor password. Please try again.')
         } else {
@@ -532,34 +590,44 @@ export default function App() {
           })
         }
         setLoading(false)
+        setPleaseWaitMessage('')
         return
       }
 
       const data = await res.json()
+      console.log('selectCatererContext: authentication success, token received')
       setActiveCaterer(caterer)
       setActiveToken(data.access_token)
       setPasswordPrompt(null)
       setPasswordError('')
       setPromptPasswordVal('')
       setManageTab('profile')
-      
+
+      console.log('selectCatererContext: calling fetchContextData')
       // 2. Fetch context lists
-      fetchContextData(caterer.id, data.access_token)
+      await fetchContextData(caterer.id, data.access_token)
+      console.log('selectCatererContext: fetchContextData completed')
     } catch (err) {
+      console.error('selectCatererContext: error caught', err)
       showAlert(err.message, 'error')
     } finally {
+      console.log('selectCatererContext: finally block running, clearing message')
       setLoading(false)
+      setPleaseWaitMessage('')
     }
   }
 
   const fetchContextData = async (catererId, token) => {
+    console.log('fetchContextData: starting fetches for caterer', catererId)
     try {
       const headers = { 'Authorization': `Bearer ${token}` }
-      
+
+      console.log('fetchContextData: fetching profile')
       // Refresh active profile details
       const profileRes = await fetch(`${apiUrl}/api/v1/caterers/${catererId}`)
       if (profileRes.ok) {
         const data = await profileRes.json()
+        console.log('fetchContextData: profile data loaded', data)
         setProfileForm({
           business_name: data.business_name || '',
           owner_name: data.owner_name || '',
@@ -577,28 +645,53 @@ export default function App() {
         })
       }
 
+      console.log('fetchContextData: fetching licenses')
       // Licenses
       const licRes = await fetch(`${apiUrl}/api/v1/licenses/?caterer_id=${catererId}`)
-      if (licRes.ok) setLicenses(await licRes.json())
+      if (licRes.ok) {
+        const licData = await licRes.json()
+        console.log('fetchContextData: licenses loaded', licData)
+        setLicenses(licData)
+      }
 
+      console.log('fetchContextData: fetching certifications')
       // Certifications
       const certRes = await fetch(`${apiUrl}/api/v1/certifications/?caterer_id=${catererId}`)
-      if (certRes.ok) setCertifications(await certRes.json())
+      if (certRes.ok) {
+        const certData = await certRes.json()
+        console.log('fetchContextData: certifications loaded', certData)
+        setCertifications(certData)
+      }
 
+      console.log('fetchContextData: fetching awards')
       // Awards
       const awardRes = await fetch(`${apiUrl}/api/v1/awards/?caterer_id=${catererId}`)
-      if (awardRes.ok) setAwards(await awardRes.json())
+      if (awardRes.ok) {
+        const awardData = await awardRes.json()
+        console.log('fetchContextData: awards loaded', awardData)
+        setAwards(awardData)
+      }
 
+      console.log('fetchContextData: fetching gallery')
       // Gallery
       const galRes = await fetch(`${apiUrl}/api/v1/gallery/?caterer_id=${catererId}`)
-      if (galRes.ok) setGallery(await galRes.json())
+      if (galRes.ok) {
+        const galData = await galRes.json()
+        console.log('fetchContextData: gallery loaded', galData)
+        setGallery(galData)
+      }
 
+      console.log('fetchContextData: fetching reviews')
       // Reviews
       const revRes = await fetch(`${apiUrl}/api/v1/reviews/?caterer_id=${catererId}`)
-      if (revRes.ok) setReviews(await revRes.json())
-
+      if (revRes.ok) {
+        const revData = await revRes.json()
+        console.log('fetchContextData: reviews loaded', revData)
+        setReviews(revData)
+      }
+      console.log('fetchContextData: all fetches completed successfully')
     } catch (err) {
-      console.error(err)
+      console.error('fetchContextData: error in try block', err)
       showAlert('Error loading caterer sub-management lists.', 'error')
     }
   }
@@ -606,6 +699,7 @@ export default function App() {
   // Context: Save profile changes
   const saveContextProfile = async (e) => {
     e.preventDefault()
+    setPleaseWaitMessage('Saving profile changes... Please wait.')
     setLoading(true)
     try {
       let imageUrl = profileForm.image_url
@@ -632,13 +726,24 @@ export default function App() {
       })
       if (!res.ok) throw new Error('Update profile failed')
       const updated = await res.json()
+
+      const wasVerified = activeCaterer.verified
       setActiveCaterer(updated)
-      showAlert('Caterer profile details updated successfully!')
+
+      if (updated.verified && !wasVerified) {
+        // Specifically transitioned to verified!
+        setVerifiedCatererName(updated.business_name)
+        setShowSuccessOverlay(true)
+      } else {
+        showAlert('Caterer profile details updated successfully!')
+      }
+
       fetchCaterers()
     } catch (err) {
       showAlert(err.message, 'error')
     } finally {
       setLoading(false)
+      setPleaseWaitMessage('')
     }
   }
 
@@ -869,7 +974,7 @@ export default function App() {
   }
 
   // Filter caterers list for directory
-  const filteredCaterers = caterers.filter(c => 
+  const filteredCaterers = caterers.filter(c =>
     (c.business_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (c.owner_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (c.city || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -880,7 +985,7 @@ export default function App() {
   const totalCaterers = caterers.length
   const totalReviews = caterers.reduce((acc, c) => acc + (c.review_count || 0), 0)
   const verifiedCaterers = caterers.filter(c => c.verified).length
-  const avgPrice = caterers.length 
+  const avgPrice = caterers.length
     ? Math.round(caterers.reduce((acc, c) => acc + (c.price_per_guest || 0), 0) / caterers.length)
     : 0
 
@@ -889,31 +994,58 @@ export default function App() {
     return (
       <div className="login-container">
         <div className="login-card">
-          <div className="login-icon">💼</div>
-          <h1>CaterHub Portal</h1>
-          <p>Sign in with your administrative credentials to manage the platform registry.</p>
-          
+          <div className="login-brand">
+            <div className="login-logo-icon">🍽️</div>
+            <h1 className="login-title">CaterHub Admin</h1>
+          </div>
+          <p className="login-subtitle">Sign in with your admin credentials to manage the platform registry.</p>
+
           <form onSubmit={handleAdminLogin} className="login-form">
             <div className="form-group">
-              <label>Administrator Email</label>
-              <input 
-                type="email" 
-                value={loginForm.email} 
-                onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} 
-                required 
+              <label>Admin Email</label>
+              <input
+                type="email"
+                value={loginForm.email}
+                onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+                required
               />
             </div>
             <div className="form-group">
-              <label>Console Passphrase</label>
-              <input 
-                type="password" 
-                placeholder="Enter admin passphrase" 
-                value={loginForm.password} 
-                onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} 
-                required 
-              />
+              <label>Admin password</label>
+              <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                <input
+                  type={showAdminPassword ? "text" : "password"}
+                  placeholder="Enter admin password"
+                  value={loginForm.password}
+                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                  required
+                  style={{ width: '100%', paddingRight: '44px' }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAdminPassword(!showAdminPassword)}
+                  style={{
+                    position: 'absolute',
+                    right: '12px',
+                    background: 'none',
+                    border: 'none',
+                    color: '#94a3b8',
+                    cursor: 'pointer',
+                    padding: '4px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: '1.2rem',
+                    transition: 'color 0.2s ease',
+                    userSelect: 'none'
+                  }}
+                  title={showAdminPassword ? "Hide password" : "Show password"}
+                >
+                  {showAdminPassword ? '👁️' : '🙈'}
+                </button>
+              </div>
             </div>
-            
+
             {loginError && (
               <p style={{ color: '#fca5a5', fontSize: '0.875rem', marginTop: '-4px', background: 'rgba(239, 68, 68, 0.1)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(239, 68, 68, 0.2)' }}>
                 ❌ {loginError}
@@ -922,18 +1054,6 @@ export default function App() {
 
             <button type="submit" className="btn btn-primary" style={{ padding: '14px', width: '100%', marginTop: '8px', fontSize: '1rem' }}>
               Sign in to Console
-            </button>
-
-            <button 
-              type="button" 
-              className="btn btn-secondary" 
-              onClick={() => {
-                setIsAdminLoggedIn(true)
-                localStorage.setItem('admin_logged_in', 'true')
-              }}
-              style={{ background: 'transparent', border: '1px dashed rgba(255,255,255,0.2)', color: '#94a3b8', padding: '12px' }}
-            >
-              Developer Quick Bypass (No Password)
             </button>
           </form>
         </div>
@@ -947,17 +1067,18 @@ export default function App() {
       {/* Sidebar Navigation */}
       <aside className="sidebar">
         <div className="sidebar-brand">
-          <span className="sidebar-logo">🍽️</span>
+          <div className="sidebar-logo-icon">🍽️</div>
           <span className="sidebar-title">CaterHub Admin</span>
         </div>
 
         <nav className="sidebar-menu">
           <div className="menu-subtitle">System Overview</div>
-          <button 
+          <button
             className={`menu-item ${!activeCaterer ? 'active' : ''}`}
             onClick={() => setActiveCaterer(null)}
           >
-            📊 Platform Dashboard
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><rect width="7" height="9" x="3" y="3" rx="1" /><rect width="7" height="5" x="14" y="3" rx="1" /><rect width="7" height="9" x="14" y="12" rx="1" /><rect width="7" height="5" x="3" y="16" rx="1" /></svg>
+            Platform Dashboard
           </button>
 
           {activeCaterer && (
@@ -965,33 +1086,35 @@ export default function App() {
               <div className="menu-separator"></div>
               <div className="menu-subtitle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span>Management Context</span>
-                <button 
+                <button
                   onClick={() => {
                     setActiveCaterer(null)
                     setActiveToken('')
-                  }} 
+                  }}
                   style={{ background: 'none', border: 'none', color: '#6366f1', fontSize: '0.75rem', fontWeight: 'bold', cursor: 'pointer' }}
                 >
                   Clear ✕
                 </button>
               </div>
-              <div style={{ padding: '0 16px 12px', fontSize: '0.85rem', color: '#ffffff', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                🏢 {activeCaterer.business_name}
+              <div style={{ padding: '0 12px 12px', fontSize: '0.82rem', color: '#ffffff', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ color: '#818cf8' }}><rect width="16" height="20" x="4" y="2" rx="2" ry="2" /><path d="M9 22v-4h6v4" /><path d="M8 6h.01" /><path d="M16 6h.01" /><path d="M8 10h.01" /><path d="M16 10h.01" /></svg>
+                {activeCaterer.business_name}
               </div>
 
               {[
-                { id: 'profile', label: '📊 Profile & Details' },
-                { id: 'licenses', label: '🛡️ Licenses' },
-                { id: 'certifications', label: '📜 Certifications' },
-                { id: 'awards', label: '🏆 Awards & Recognition' },
-                { id: 'gallery', label: '🖼️ Photos & Videos' },
-                { id: 'reviews', label: `⭐ Customer Reviews (${reviews.length})` }
+                { id: 'profile', label: 'Profile & Details', icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg> },
+                { id: 'licenses', label: 'Licenses', icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg> },
+                { id: 'certifications', label: 'Certifications', icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" /><polyline points="14 2 14 8 20 8" /></svg> },
+                { id: 'awards', label: 'Awards & Recognition', icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" /><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" /><path d="M4 22h16" /><path d="M10 14.66V17c0 .55-.45 1-1 1H4v2h16v-2h-5c-.55 0-1-.45-1-1v-2.34" /><path d="M12 2a6 6 0 0 1 6 6v3.76c0 1.62-1.1 3-2.68 3.39L12 16l-3.32-.85C7.1 14.76 6 13.38 6 11.76V8a6 6 0 0 1 6-6z" /></svg> },
+                { id: 'gallery', label: 'Photos & Videos', icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg> },
+                { id: 'reviews', label: `Customer Reviews (${reviews.length})`, icon: <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg> }
               ].map(tab => (
                 <button
                   key={tab.id}
                   className={`menu-item ${manageTab === tab.id ? 'active' : ''}`}
                   onClick={() => setManageTab(tab.id)}
                 >
+                  {tab.icon}
                   {tab.label}
                 </button>
               ))}
@@ -1000,8 +1123,9 @@ export default function App() {
 
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div className="menu-separator"></div>
-            <button className="menu-item" onClick={handleAdminLogout} style={{ color: '#ef4444' }}>
-              🚪 Log out
+            <button className="menu-item" onClick={handleAdminLogout} style={{ color: '#f87171' }}>
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px', color: '#f87171' }}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" x2="9" y1="12" y2="12" /></svg>
+              Log out
             </button>
           </div>
         </nav>
@@ -1009,7 +1133,7 @@ export default function App() {
 
       {/* Main Panel Content */}
       <main className="main-content">
-        
+
         {/* Global Notifications */}
         {alert.text && (
           <div className={`alert alert-${alert.type === 'error' ? 'error' : 'success'}`}>
@@ -1026,7 +1150,7 @@ export default function App() {
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', marginBottom: '16px' }}>
                 Auth as `{passwordPrompt.email}` failed. Enter their custom vendor password:
               </p>
-              <input 
+              <input
                 type="password"
                 className="form-group"
                 placeholder="Vendor Password"
@@ -1069,47 +1193,51 @@ export default function App() {
             {/* Platform metrics */}
             <div className="stats-grid">
               <div className="stat-card">
-                <div className="stat-icon-wrapper" style={{ background: '#e0e7ff', color: '#6366f1' }}>🏢</div>
+                <div className="stat-icon-wrapper" style={{ background: '#e0e7ff', color: '#6366f1' }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect width="16" height="20" x="4" y="2" rx="2" ry="2" /><path d="M9 22v-4h6v4" /><path d="M8 6h.01" /><path d="M16 6h.01" /><path d="M8 10h.01" /><path d="M16 10h.01" /></svg>
+                </div>
                 <div className="stat-info">
                   <span className="stat-label">Total Caterers</span>
                   <span className="stat-value">{totalCaterers}</span>
                 </div>
               </div>
               <div className="stat-card">
-                <div className="stat-icon-wrapper" style={{ background: '#d1fae5', color: '#10b981' }}>🛡️</div>
+                <div className="stat-icon-wrapper" style={{ background: '#d1fae5', color: '#10b981' }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /><path d="m9 11 2 2 4-4" /></svg>
+                </div>
                 <div className="stat-info">
                   <span className="stat-label">Verified Partners</span>
                   <span className="stat-value">{verifiedCaterers}</span>
                 </div>
               </div>
               <div className="stat-card">
-                <div className="stat-icon-wrapper" style={{ background: '#fef3c7', color: '#f59e0b' }}>⭐</div>
+                <div className="stat-icon-wrapper" style={{ background: '#fef3c7', color: '#f59e0b' }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" /></svg>
+                </div>
                 <div className="stat-info">
                   <span className="stat-label">Total Reviews</span>
                   <span className="stat-value">{totalReviews}</span>
                 </div>
               </div>
-              <div className="stat-card">
-                <div className="stat-icon-wrapper" style={{ background: '#fee2e2', color: '#ef4444' }}>₹</div>
-                <div className="stat-info">
-                  <span className="stat-label">Avg. Price / Plate</span>
-                  <span className="stat-value">₹{avgPrice}</span>
-                </div>
-              </div>
+
             </div>
 
             {/* Caterer List Table */}
             <div className="card">
-              <div className="card-header" style={{ borderBottom: 'none', marginBottom: '12px' }}>
-                <h3 className="card-title">📖 Caterer Directory ({filteredCaterers.length})</h3>
-                <div className="search-bar-container" style={{ marginBottom: 0 }}>
-                  <input 
-                    type="text" 
+              <div className="card-header" style={{ borderBottom: 'none', paddingBottom: 0, marginBottom: '20px' }}>
+                <h3 className="card-title" style={{ fontSize: '1.2rem', fontWeight: 800 }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '6px', color: 'var(--primary)' }}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="16" x2="8" y1="13" y2="13" /><line x1="16" x2="8" y1="17" y2="17" /><line x1="10" x2="8" y1="9" y2="9" /></svg>
+                  Caterer Directory ({filteredCaterers.length})
+                </h3>
+                <div className="search-bar-container" style={{ margin: 0, position: 'relative', display: 'flex', alignItems: 'center' }}>
+                  <input
+                    type="text"
                     placeholder="Search name, owner, city or cuisine..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    style={{ padding: '8px 16px', border: '1px solid var(--border)', borderRadius: '8px', minWidth: '280px' }}
+                    style={{ padding: '10px 16px 10px 38px', border: '1px solid var(--border)', borderRadius: '8px', minWidth: '320px', fontSize: '0.85rem' }}
                   />
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ position: 'absolute', left: '14px', color: 'var(--text-muted)' }}><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
                 </div>
               </div>
 
@@ -1122,7 +1250,6 @@ export default function App() {
                       <th>Business Profile</th>
                       <th>Owner / Contact</th>
                       <th>Cuisine</th>
-                      <th>Pricing / Plate</th>
                       <th>Compliance</th>
                       <th>Actions</th>
                     </tr>
@@ -1133,41 +1260,39 @@ export default function App() {
                         <td>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                             <div style={{ width: '40px', height: '40px', borderRadius: '8px', overflow: 'hidden', background: '#f1f5f9' }}>
-                              <img src={c.image_url || 'https://images.unsplash.com/photo-1555244162-803834f70033?w=80'} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(e) => { e.target.src = 'https://images.unsplash.com/photo-1555244162-803834f70033?w=80' }} />
+                              <img src={cleanImageUrl(c.image_url) || 'https://images.unsplash.com/photo-1555244162-803834f70033?w=80'} alt="" referrerPolicy="no-referrer" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(e) => { e.target.onerror = null; e.target.src = 'https://images.unsplash.com/photo-1555244162-803834f70033?w=80' }} />
                             </div>
-                            <div>
-                              <strong style={{ fontSize: '0.95rem' }}>{c.business_name}</strong>
-                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>📍 {c.city}, {c.state}</div>
+                            <div style={{ maxWidth: '240px', wordBreak: 'break-word' }}>
+                              <strong style={{ fontSize: '0.95rem', display: 'block' }}>{c.business_name}</strong>
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '4px' }}>📍 {c.city}, {c.state}</div>
                             </div>
                           </div>
                         </td>
                         <td>
                           <div>{c.owner_name}</div>
-                          <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{c.email}</div>
+                          <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', maxWidth: '180px', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={c.email}>{c.email}</div>
                         </td>
                         <td>
                           <span className="badge badge-info">{c.cuisine_type || 'General'}</span>
                         </td>
+
                         <td>
-                          <strong>₹{c.price_per_guest || 'N/A'}</strong>
-                        </td>
-                        <td>
-                          <button 
-                            onClick={() => toggleVerification(c)}
+                          <span
                             className={`badge ${c.verified ? 'badge-success' : 'badge-muted'}`}
-                            style={{ border: 'none', cursor: 'pointer' }}
-                            title="Toggle verification badge"
+                            title={c.verified ? 'Verified Platform Partner' : 'Verification Pending'}
                           >
                             {c.verified ? '🛡️ Verified' : '🔘 Pending'}
-                          </button>
+                          </span>
                         </td>
                         <td>
                           <div style={{ display: 'flex', gap: '8px' }}>
-                            <button className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => selectCatererContext(c)}>
-                              🛠️ Manage
+                            <button className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '0.8rem', gap: '4px' }} onClick={() => selectCatererContext(c)}>
+                              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" /></svg>
+                              Manage
                             </button>
-                            <button className="btn btn-danger" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => deleteCaterer(c.id, c.business_name)}>
-                              🗑️ Delete
+                            <button className="btn btn-danger" style={{ padding: '6px 12px', fontSize: '0.8rem', gap: '4px' }} onClick={() => deleteCaterer(c.id, c.business_name)}>
+                              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></svg>
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -1197,31 +1322,31 @@ export default function App() {
                     <div className="form-row">
                       <div className="form-group">
                         <label>Business Name *</label>
-                        <input type="text" placeholder="e.g. Royal Taj Catering" value={newCatererForm.business_name} onChange={e => setNewCatererForm({...newCatererForm, business_name: e.target.value})} required />
+                        <input type="text" placeholder="e.g. Royal Taj Catering" value={newCatererForm.business_name} onChange={e => setNewCatererForm({ ...newCatererForm, business_name: e.target.value })} required />
                       </div>
                       <div className="form-group">
                         <label>Owner Name *</label>
-                        <input type="text" placeholder="e.g. Aarav Sharma" value={newCatererForm.owner_name} onChange={e => setNewCatererForm({...newCatererForm, owner_name: e.target.value})} required />
+                        <input type="text" placeholder="e.g. Aarav Sharma" value={newCatererForm.owner_name} onChange={e => setNewCatererForm({ ...newCatererForm, owner_name: e.target.value })} required />
                       </div>
                     </div>
                     <div className="form-row">
                       <div className="form-group">
                         <label>Email Address *</label>
-                        <input type="email" placeholder="e.g. contact@business.com" value={newCatererForm.email} onChange={e => setNewCatererForm({...newCatererForm, email: e.target.value})} required />
+                        <input type="email" placeholder="e.g. contact@business.com" value={newCatererForm.email} onChange={e => setNewCatererForm({ ...newCatererForm, email: e.target.value })} required />
                       </div>
                       <div className="form-group">
                         <label>Mobile Number</label>
-                        <input type="text" placeholder="e.g. +91 98765 43210" value={newCatererForm.mobile} onChange={e => setNewCatererForm({...newCatererForm, mobile: e.target.value})} />
+                        <input type="text" placeholder="e.g. +91 98765 43210" value={newCatererForm.mobile} onChange={e => setNewCatererForm({ ...newCatererForm, mobile: e.target.value })} />
                       </div>
                     </div>
                     <div className="form-row">
                       <div className="form-group">
                         <label>Account Password *</label>
-                        <input type="password" value={newCatererForm.password} onChange={e => setNewCatererForm({...newCatererForm, password: e.target.value})} required />
+                        <input type="password" value={newCatererForm.password} onChange={e => setNewCatererForm({ ...newCatererForm, password: e.target.value })} required />
                       </div>
                       <div className="form-group">
                         <label>Cuisine Type *</label>
-                        <select value={newCatererForm.cuisine_type} onChange={e => setNewCatererForm({...newCatererForm, cuisine_type: e.target.value})} required>
+                        <select value={newCatererForm.cuisine_type} onChange={e => setNewCatererForm({ ...newCatererForm, cuisine_type: e.target.value })} required>
                           <option value="North Indian">North Indian</option>
                           <option value="South Indian">South Indian</option>
                           <option value="Bengali & Fusion">Bengali & Fusion</option>
@@ -1234,26 +1359,26 @@ export default function App() {
                     <div className="form-row">
                       <div className="form-group">
                         <label>City *</label>
-                        <input type="text" placeholder="Mumbai" value={newCatererForm.city} onChange={e => setNewCatererForm({...newCatererForm, city: e.target.value})} required />
+                        <input type="text" placeholder="Mumbai" value={newCatererForm.city} onChange={e => setNewCatererForm({ ...newCatererForm, city: e.target.value })} required />
                       </div>
                       <div className="form-group">
                         <label>State *</label>
-                        <input type="text" placeholder="Maharashtra" value={newCatererForm.state} onChange={e => setNewCatererForm({...newCatererForm, state: e.target.value})} required />
+                        <input type="text" placeholder="Maharashtra" value={newCatererForm.state} onChange={e => setNewCatererForm({ ...newCatererForm, state: e.target.value })} required />
                       </div>
                     </div>
                     <div className="form-row">
                       <div className="form-group">
                         <label>Price per guest (₹)</label>
-                        <input type="number" placeholder="850" value={newCatererForm.price_per_guest} onChange={e => setNewCatererForm({...newCatererForm, price_per_guest: e.target.value})} />
+                        <input type="number" placeholder="850" value={newCatererForm.price_per_guest} onChange={e => setNewCatererForm({ ...newCatererForm, price_per_guest: e.target.value })} />
                       </div>
                       <div className="form-group">
                         <label>Zip/Pin Code</label>
-                        <input type="text" placeholder="400020" value={newCatererForm.zip} onChange={e => setNewCatererForm({...newCatererForm, zip: e.target.value})} />
+                        <input type="text" placeholder="400020" value={newCatererForm.zip} onChange={e => setNewCatererForm({ ...newCatererForm, zip: e.target.value })} />
                       </div>
                     </div>
                     <div className="form-group">
                       <label>Address</label>
-                      <input type="text" placeholder="45, Marine Drive" value={newCatererForm.address} onChange={e => setNewCatererForm({...newCatererForm, address: e.target.value})} />
+                      <input type="text" placeholder="45, Marine Drive" value={newCatererForm.address} onChange={e => setNewCatererForm({ ...newCatererForm, address: e.target.value })} />
                     </div>
                     <div className="form-group">
                       <label>Profile Image URL or File Upload</label>
@@ -1262,13 +1387,13 @@ export default function App() {
                           type="text"
                           placeholder="https://images.unsplash.com/photo-..."
                           value={newCatererForm.image_url}
-                          onChange={e => setNewCatererForm({...newCatererForm, image_url: e.target.value})}
+                          onChange={e => setNewCatererForm({ ...newCatererForm, image_url: e.target.value })}
                           style={{ flexGrow: 1 }}
                         />
                         <input
                           type="file"
                           accept="image/*"
-                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewCatererForm({...newCatererForm, image_url: url}))}
+                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewCatererForm({ ...newCatererForm, image_url: url }))}
                           style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
                           id="register-profile-image-file"
                         />
@@ -1279,7 +1404,7 @@ export default function App() {
                     </div>
                     <div className="form-group">
                       <label>Biography</label>
-                      <textarea placeholder="Tell clients about this caterer..." rows={3} value={newCatererForm.bio} onChange={e => setNewCatererForm({...newCatererForm, bio: e.target.value})} />
+                      <textarea placeholder="Tell clients about this caterer..." rows={3} value={newCatererForm.bio} onChange={e => setNewCatererForm({ ...newCatererForm, bio: e.target.value })} />
                     </div>
                     <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '14px', marginTop: '12px' }} disabled={loading}>
                       Create Profile Account
@@ -1296,18 +1421,18 @@ export default function App() {
                     <h3 className="card-title">📥 Bulk Vendor Importer</h3>
                     <button onClick={() => { setShowBulkModal(false); setBulkResult(null); setExcelRows([]); }} style={{ background: 'none', border: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
                   </div>
-                  
+
                   <div style={{ padding: '20px 20px 0' }}>
                     <div className="importer-tabs">
-                      <button 
-                        type="button" 
+                      <button
+                        type="button"
                         className={`importer-tab-btn ${importTab === 'file' ? 'active' : ''}`}
                         onClick={() => setImportTab('file')}
                       >
                         📂 Excel / CSV File
                       </button>
-                      <button 
-                        type="button" 
+                      <button
+                        type="button"
                         className={`importer-tab-btn ${importTab === 'json' ? 'active' : ''}`}
                         onClick={() => setImportTab('json')}
                       >
@@ -1328,7 +1453,7 @@ export default function App() {
                       </div>
 
                       {excelRows.length === 0 ? (
-                        <div 
+                        <div
                           className={`drag-drop-zone ${dragActive ? 'active' : ''}`}
                           onDragEnter={handleDrag}
                           onDragOver={handleDrag}
@@ -1336,10 +1461,10 @@ export default function App() {
                           onDrop={handleDrop}
                           onClick={() => fileInputRef.current.click()}
                         >
-                          <input 
+                          <input
                             ref={fileInputRef}
-                            type="file" 
-                            accept=".xlsx,.xls,.csv" 
+                            type="file"
+                            accept=".xlsx,.xls,.csv"
                             style={{ display: 'none' }}
                             onChange={handleFileChange}
                           />
@@ -1373,19 +1498,19 @@ export default function App() {
                                   {excelRows.map((row, idx) => (
                                     <tr key={idx} className={row.isValid ? '' : 'row-invalid'}>
                                       <td>
-                                        <strong>{row.business_name || <em style={{color: 'var(--danger)'}}>Missing Business Name</em>}</strong>
+                                        <strong>{row.business_name || <em style={{ color: 'var(--danger)' }}>Missing Business Name</em>}</strong>
                                         <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{row.owner_name}</div>
                                       </td>
                                       <td>
-                                        {row.email || <em style={{color: 'var(--danger)'}}>Missing Email</em>}
+                                        {row.email || <em style={{ color: 'var(--danger)' }}>Missing Email</em>}
                                         {row.isEmailAutoGenerated && (
                                           <div style={{ fontSize: '0.7rem', color: 'var(--primary)', fontStyle: 'italic', marginTop: '2px' }}>
                                             (Auto-generated)
                                           </div>
                                         )}
                                       </td>
-                                      <td>{row.city || <em style={{color: 'var(--danger)'}}>Missing City</em>}, {row.state || <em style={{color: 'var(--danger)'}}>Missing State</em>}</td>
-                                      <td>{row.cuisine_type || <span style={{color: 'var(--text-muted)'}}>None</span>}</td>
+                                      <td>{row.city || <em style={{ color: 'var(--danger)' }}>Missing City</em>}, {row.state || <em style={{ color: 'var(--danger)' }}>Missing State</em>}</td>
+                                      <td>{row.cuisine_type || <span style={{ color: 'var(--text-muted)' }}>None</span>}</td>
                                       <td>
                                         {row.isValid ? (
                                           <span className="status-badge valid">✓ Ready</span>
@@ -1404,24 +1529,24 @@ export default function App() {
 
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
                             <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
-                              <input 
-                                type="checkbox" 
-                                checked={skipErrors} 
-                                onChange={e => setSkipErrors(e.target.checked)} 
+                              <input
+                                type="checkbox"
+                                checked={skipErrors}
+                                onChange={e => setSkipErrors(e.target.checked)}
                               />
                               Skip rows with validation errors
                             </label>
-                            
+
                             <div style={{ display: 'flex', gap: '12px' }}>
-                              <button 
-                                type="button" 
+                              <button
+                                type="button"
                                 className="btn btn-secondary"
                                 onClick={() => { setExcelRows([]); setSkipErrors(false); }}
                               >
                                 🗑️ Reset / Upload New File
                               </button>
-                              <button 
-                                type="button" 
+                              <button
+                                type="button"
                                 className="btn btn-primary"
                                 onClick={handleImportExcelRows}
                                 disabled={loading || (!skipErrors && excelRows.some(r => !r.isValid))}
@@ -1499,7 +1624,7 @@ export default function App() {
                         <span>Created: <strong style={{ color: 'var(--success)' }}>{bulkResult.created_count}</strong></span>
                         <span>Failed: <strong style={{ color: '#ef4444' }}>{bulkResult.failed_count}</strong></span>
                       </div>
-                      
+
                       {bulkResult.errors && bulkResult.errors.length > 0 && (
                         <div style={{ maxHeight: '150px', overflowY: 'auto', textAlign: 'left' }}>
                           <h5 style={{ fontSize: '0.85rem', color: '#ef4444', marginBottom: '4px' }}>Errors:</h5>
@@ -1624,11 +1749,11 @@ export default function App() {
                     <textarea rows={4} value={profileForm.bio} onChange={e => setProfileForm({ ...profileForm, bio: e.target.value })} />
                   </div>
                   <div className="form-group" style={{ flexDirection: 'row', alignItems: 'center', gap: '12px', padding: '12px', border: '1px dashed var(--border)', borderRadius: '8px', background: '#fafafa', marginTop: '8px' }}>
-                    <input 
+                    <input
                       id="ctx-verified"
-                      type="checkbox" 
-                      checked={!!profileForm.verified} 
-                      onChange={e => setProfileForm({ ...profileForm, verified: e.target.checked })} 
+                      type="checkbox"
+                      checked={!!profileForm.verified}
+                      onChange={e => setProfileForm({ ...profileForm, verified: e.target.checked })}
                       style={{ width: '18px', height: '18px', cursor: 'pointer' }}
                     />
                     <label htmlFor="ctx-verified" style={{ cursor: 'pointer', userSelect: 'none' }}>🛡️ Approve profile and mark as verified platform partner</label>
@@ -1876,11 +2001,11 @@ export default function App() {
                   <div className="card-header">
                     <h3 className="card-title">🖼️ Media Gallery Portfolio</h3>
                   </div>
-                  
+
                   <div className="gallery-grid" style={{ marginBottom: '16px' }}>
                     {gallery.map(item => (
                       <div key={item.id} className="gallery-card">
-                        <img src={item.file_url || 'https://images.unsplash.com/photo-1555244162-803834f70033?w=300'} alt="" onError={(e) => { e.target.src = 'https://images.unsplash.com/photo-1555244162-803834f70033?w=300' }} />
+                        <img src={cleanImageUrl(item.file_url) || 'https://images.unsplash.com/photo-1555244162-803834f70033?w=300'} alt="" onError={(e) => { e.target.onerror = null; e.target.src = 'https://images.unsplash.com/photo-1555244162-803834f70033?w=300' }} />
                         <button className="gallery-delete-btn" onClick={() => handleDeletePhoto(item.id)}>✕</button>
                       </div>
                     ))}
@@ -1903,12 +2028,12 @@ export default function App() {
                         <input
                           type="file"
                           accept="image/*"
-                          onChange={e => handleFileUpload(e.target.files[0], (url) => setNewPhoto({ ...newPhoto, file_url: url }))}
+                          onChange={e => handleGalleryFileUpload(e.target.files[0])}
                           style={{ opacity: 0, width: 0, height: 0, position: 'absolute' }}
                           id="new-photo-image-file"
                         />
                         <label htmlFor="new-photo-image-file" className="btn btn-secondary" style={{ cursor: 'pointer', whiteSpace: 'nowrap', margin: 0, padding: '10px 14px' }}>
-                          📁 Upload File
+                          📁 Upload & Save File
                         </label>
                       </div>
                     </div>
@@ -1961,6 +2086,167 @@ export default function App() {
         )}
 
       </main>
+
+      {/* Style element for spinner and animations */}
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        @keyframes scaleIn {
+          0% { transform: scale(0.92); opacity: 0; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes pulseRing {
+          0% { transform: scale(0.95); opacity: 0.5; }
+          50% { transform: scale(1.1); opacity: 0.3; }
+          100% { transform: scale(1.2); opacity: 0; }
+        }
+        .spin-loader {
+          width: 50px;
+          height: 50px;
+          border: 4px solid rgba(99, 102, 241, 0.15);
+          border-top: 4px solid #6366f1;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+        }
+        .verified-pulse-ring {
+          position: absolute;
+          width: 80px;
+          height: 80px;
+          border-radius: 50%;
+          border: 4px solid #10b981;
+          animation: pulseRing 2s infinite ease-out;
+        }
+      `}</style>
+
+      {/* Please Wait Overlay */}
+      {pleaseWaitMessage && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(3, 7, 18, 0.5)',
+          backdropFilter: 'blur(10px)',
+          WebkitBackdropFilter: 'blur(10px)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 99999,
+          animation: 'fadeIn 0.25s ease-out'
+        }}>
+          <div style={{
+            background: '#ffffff',
+            padding: '40px',
+            borderRadius: '24px',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '24px',
+            width: '90%',
+            maxWidth: '380px',
+            animation: 'scaleIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)'
+          }}>
+            <div className="spin-loader" />
+            <div style={{ textAlign: 'center' }}>
+              <h4 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 800, color: '#1f2937' }}>Processing Request</h4>
+              <p style={{ margin: '8px 0 0', fontSize: '0.9rem', color: '#6b7280', fontWeight: 500 }}>
+                {pleaseWaitMessage}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Verification Successful Overlay */}
+      {showSuccessOverlay && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(3, 7, 18, 0.6)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 99999,
+          animation: 'fadeIn 0.25s ease-out'
+        }}>
+          <div style={{
+            background: '#ffffff',
+            padding: '40px 32px',
+            borderRadius: '24px',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.3)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            textAlign: 'center',
+            width: '90%',
+            maxWidth: '420px',
+            position: 'relative',
+            animation: 'scaleIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1)'
+          }}>
+            {/* Pulsing ring behind check icon */}
+            <div className="verified-pulse-ring" />
+
+            {/* Verification icon (shield with checkmark or big verified icon) */}
+            <div style={{
+              width: '80px',
+              height: '80px',
+              background: '#ecfdf5',
+              borderRadius: '50%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: '40px',
+              color: '#10b981',
+              marginBottom: '24px',
+              boxShadow: '0 8px 16px rgba(16, 185, 129, 0.1)',
+              position: 'relative',
+              zIndex: 2
+            }}>
+              🛡️
+            </div>
+
+            <h3 style={{ margin: '0 0 10px', fontSize: '1.5rem', fontWeight: 800, color: '#10b981' }}>
+              Verification Successful
+            </h3>
+
+            <p style={{ margin: '0 0 24px', fontSize: '0.95rem', color: '#4b5563', lineHeight: 1.5 }}>
+              <strong>{verifiedCatererName}</strong> has been successfully approved and marked as a <strong>Verified Platform Partner</strong>.
+            </p>
+
+            <button
+              className="btn btn-primary"
+              style={{
+                width: '100%',
+                padding: '12px 24px',
+                borderRadius: '12px',
+                fontWeight: 600,
+                background: '#10b981',
+                borderColor: '#10b981',
+                boxShadow: '0 4px 12px rgba(16, 185, 129, 0.2)'
+              }}
+              onClick={() => setShowSuccessOverlay(false)}
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }
